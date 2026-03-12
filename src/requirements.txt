@@ -1,0 +1,6 @@
+streamlit
+paddlepaddle
+paddleocr
+opencv-python-headless
+Pillow
+numpy

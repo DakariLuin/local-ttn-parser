@@ -1,0 +1,12 @@
+venv/
+.venv/
+env/
+
+__pycache__/
+*.pyc
+
+.paddleocr/
+.paddlex/
+
+.DS_Store
+Thumbs.db
