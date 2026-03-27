@@ -72,7 +72,10 @@ class DataExtractor:
 
 
 class TTNPipeline:
-    """Главный класс конвейера"""
+    """Legacy MVP конвейер (оставлен для обратной совместимости).
+
+    Основной production-пайплайн с region-based парсингом таблиц находится в app.py/table_parser.py.
+    """
     def __init__(self):
         self.preprocessor = ImagePreprocessor()
         self.ocr_engine = OCREngine()

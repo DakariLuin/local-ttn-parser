@@ -1,148 +1,129 @@
 import streamlit as st
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-import paddle
+from PIL import Image
 from paddleocr import PaddleOCR
-import math
+import pandas as pd
+
+from config import DOC_TEMPLATES
+from table_parser import FieldExtractor, TableParser
 
 # ==========================================
-# 1. МОДУЛЬ ПРЕДОБРАБОТКИ ИЗОБРАЖЕНИЙ
+# 1. OCR И ПРЕДОБРАБОТКА
 # ==========================================
 class ImagePreprocessor:
     @staticmethod
     def enhance_image(image: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-        denoised = cv2.fastNlMeansDenoising(gray, h=30)
+        denoised = cv2.bilateralFilter(gray, 5, 50, 50) 
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(denoised)
-        return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
+        return cv2.cvtColor(clahe.apply(denoised), cv2.COLOR_GRAY2RGB)
 
-
-# ==========================================
-# 2. МОДУЛЬ OCR И ИЗВЛЕЧЕНИЯ
-# ==========================================
 class OCRProcessor:
     def __init__(self):
-        self.ocr = PaddleOCR(use_angle_cls=True, lang='ru')
+        self.engine = PaddleOCR(use_angle_cls=True, lang='ru', show_log=False, 
+                                det_db_unclip_ratio=1.5, det_db_thresh=0.2, 
+                                det_db_box_thresh=0.5, det_limit_side_len=1500)
 
-    def extract_data(self, image: np.ndarray):
-        results = self.ocr.ocr(image)
-        return results[0] if results and results[0] else []
-
-    @staticmethod
-    def draw_boxes(image: Image.Image, ocr_results: list) -> Image.Image:
-        draw_img = image.copy()
-        draw = ImageDraw.Draw(draw_img)
-        for line in ocr_results:
-            if line and len(line) > 0:
-                box = line[0]
-                points = [(point[0], point[1]) for point in box]
-                draw.polygon(points, outline="red", width=3)
-        return draw_img
-
-    @staticmethod
-    def structure_text_spatially(ocr_results: list) -> dict:
-        """
-        Группирует текст по координате Y (собирает текст в логические строки).
-        Это первый шаг к структурированию ТТН до применения LLM/RegEx.
-        """
-        lines = []
-        for res in ocr_results:
-            box = res[0]
-            text = res[1][0]
-            # Берем среднюю Y-координату блока
-            center_y = sum([point[1] for point in box]) / 4
-            lines.append({"y": center_y, "text": text, "box": box})
-            
-        # Сортируем все блоки сверху вниз
-        lines.sort(key=lambda x: x['y'])
-        
-        structured_lines = {}
-        line_threshold = 15 # Погрешность в пикселях для одной строки
-        
-        current_y = None
-        for item in lines:
-            if current_y is None:
-                current_y = item['y']
-                structured_lines[current_y] = [item['text']]
-            elif abs(item['y'] - current_y) < line_threshold:
-                # Текст находится на той же визуальной строке
-                structured_lines[current_y].append(item['text'])
-            else:
-                # Новая строка
-                current_y = item['y']
-                structured_lines[current_y] = [item['text']]
-                
-        # Форматируем в читаемый вид
-        formatted_output = {}
-        for idx, (y, texts) in enumerate(structured_lines.items()):
-            # Соединяем текст на одной строке через разделитель
-            formatted_output[f"Строка {idx+1}"] = " | ".join(texts)
-            
-        return formatted_output
-
+    def extract_data(self, image: np.ndarray, progress_bar=None):
+        dt_boxes, _ = self.engine.text_detector(image)
+        if dt_boxes is None or len(dt_boxes) == 0: return []
+        results = []
+        for i, box in enumerate(dt_boxes):
+            pts = box.astype("float32")
+            w, h = int(np.linalg.norm(pts[0]-pts[1])), int(np.linalg.norm(pts[0]-pts[3]))
+            # Минимальный паддинг 2px
+            M = cv2.getPerspectiveTransform(pts, np.array([[2,2],[w+2,2],[w+2,h+2],[2,h+2]], "float32"))
+            crop = cv2.warpPerspective(image, M, (w+4, h+4))
+            up = cv2.resize(crop, (w*3, h*3), interpolation=cv2.INTER_LANCZOS4)
+            rec, _ = self.engine.text_recognizer([up])
+            if rec and rec[0][1] > 0.4:
+                results.append([box.tolist(), rec[0]])
+            if progress_bar: progress_bar.progress((i+1)/len(dt_boxes))
+        return results
 
 # ==========================================
-# 3. GUI
+# 2. GUI
 # ==========================================
-st.set_page_config(page_title="Демо-стенд OCR ТТН", layout="wide")
-st.title("👁️ Демонстрационный стенд распознавания ТТН")
-st.markdown("Загрузите фото или скан накладной. Система автоматически очистит фото, выровняет текст и извлечет данные.")
+st.set_page_config(page_title="TTN Parser Elite", layout="wide")
 
-# Инициализация модулей (кэшируем OCR, чтобы не грузить модель в память каждый раз)
 @st.cache_resource
-def get_ocr_processor():
-    return OCRProcessor()
+def get_ocr(): return OCRProcessor()
+ocr = get_ocr()
 
-preprocessor = ImagePreprocessor()
-ocr_processor = get_ocr_processor()
+st.title("📄 ТТН в json")
 
-# Модуль загрузки
-uploaded_file = st.file_uploader("📂 Загрузите скан или фото (JPG, PNG)", type=['png', 'jpg', 'jpeg'])
+with st.sidebar:
+    selected_template = st.selectbox("Шаблон:", list(DOC_TEMPLATES.keys()))
+    config = DOC_TEMPLATES[selected_template]
 
-if uploaded_file is not None:
-    # Чтение изображения
-    original_image = Image.open(uploaded_file)
-    original_array = np.array(original_image)
+up_file = st.file_uploader("Загрузите файл", type=['png', 'jpg', 'jpeg'])
+
+if up_file:
+    img_arr = np.array(Image.open(up_file))
+    p_bar = st.progress(0)
+    enhanced = ImagePreprocessor.enhance_image(img_arr)
+    raw_data = ocr.extract_data(enhanced, p_bar)
+    p_bar.empty()
     
-    st.divider()
-    
-    # Создаем 3 колонки для пошаговой демонстрации
-    col1, col2, col3 = st.columns(3)
-    
-    with st.spinner("Магия происходит... (Предобработка и OCR)"):
-        # 1. Предобработка
-        enhanced_array = preprocessor.enhance_image(original_array)
-        enhanced_image = Image.fromarray(enhanced_array)
-        
-        # 2. OCR Распознавание
-        raw_ocr_data = ocr_processor.extract_data(enhanced_array)
-        
-        # 3. Визуализация рамок
-        boxed_image = ocr_processor.draw_boxes(enhanced_image, raw_ocr_data)
-        
-        # 4. Базовое пространственное структурирование
-        structured_data = ocr_processor.structure_text_spatially(raw_ocr_data)
+    col_img, col_res = st.columns([1, 1.8])
+    with col_img: st.image(enhanced)
 
-    # --- ОТОБРАЖЕНИЕ РЕЗУЛЬТАТОВ ---
-    
-    with col1:
-        st.subheader("1. Оригинал")
-        st.image(original_image, use_column_width=True)
-        st.caption("Сырое фото с телефона/сканера")
-
-    with col2:
-        st.subheader("2. Предобработка + Поиск")
-        st.image(boxed_image, use_column_width=True)
-        st.caption("Удаление шумов, выравнивание света, поиск текстовых блоков (Bounding Boxes)")
-
-    with col3:
-        st.subheader("3. Базово-структурированный текст")
-        st.markdown("Текст сгруппирован по визуальным строкам (сверху-вниз, слева-направо).")
-        st.json(structured_data)
+    with col_res:
+        # 1. Поля (FIELDS)
+        field_keywords = []
+        for kws in config.get("FIELDS", {}).values(): field_keywords.extend(kws)
         
-        # Дополнительный вывод полного склеенного текста
-        with st.expander("Показать весь текст сплошняком"):
-            full_text = " ".join([res[1][0] for res in raw_ocr_data])
-            st.write(full_text)
+        parser_settings = config.get("PARSER_SETTINGS", {})
+        table_regions = TableParser.detect_table_regions(
+            ocr_results=raw_data,
+            tables_cfg=config.get("TABLES", {}),
+            field_keywords=field_keywords,
+            parser_settings=parser_settings,
+        )
+        free_text_y_min = 0.0
+        if table_regions:
+            free_text_y_min = max(region["y_max"] for region in table_regions.values()) + 5
+
+        fields, used_idx = FieldExtractor.extract_from_free_text(
+            raw_data,
+            config.get("FIELDS", {}),
+            free_text_y_min=free_text_y_min,
+            table_regions=table_regions,
+        )
+        
+        st.subheader("📝 Поля документа")
+        f_cols = st.columns(len(fields))
+        for i, (k, v) in enumerate(fields.items()):
+            with f_cols[i % len(f_cols)]:
+                st.metric(k, v if v else "❌")
+        
+        st.divider()
+
+        # 2. Таблицы
+        if "TABLES" in config:
+            for t_name, t_cfg in config["TABLES"].items():
+                st.subheader(f"📊 {t_name}")
+                df, missing = TableParser.extract_table(
+                    raw_data,
+                    t_cfg,
+                    t_name,
+                    used_idx,
+                    img_arr.shape[1],
+                    field_keywords,
+                    parser_settings=parser_settings,
+                    region_bounds=table_regions.get(t_name),
+                )
+                
+                if not df.empty:
+                    # Функция для закрашивания missing столбцов
+                    def highlight(x):
+                        c = 'background-color: #ffffcc'
+                        df1 = pd.DataFrame('', index=x.index, columns=x.columns)
+                        for col in missing:
+                            if col in df1.columns: df1[col] = c
+                        return df1
+
+                    st.dataframe(df.style.apply(highlight, axis=None), use_container_width=True, hide_index=True)
+                    st.download_button(f"Скачать JSON", df.to_json(orient='records', force_ascii=False), key=f"d_{t_name}")
+                else: st.warning(f"Таблица '{t_name}' не найдена.")

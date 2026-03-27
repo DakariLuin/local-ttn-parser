@@ -1,6 +1,8 @@
-streamlit
-paddlepaddle
-paddleocr
-opencv-python-headless
-Pillow
-numpy
+streamlit==1.32.0
+paddlepaddle==2.6.2
+paddleocr==2.7.3
+opencv-python-headless==4.11.0.86
+Pillow==10.4.0
+numpy==1.26.4
+pandas==2.2.3
+pydantic==2.7.0
