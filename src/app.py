@@ -1,129 +1,130 @@
 import streamlit as st
-import cv2
-import numpy as np
+import json
+import torch
 from PIL import Image
-from paddleocr import PaddleOCR
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
 import pandas as pd
+import re
 
 from config import DOC_TEMPLATES
-from table_parser import FieldExtractor, TableParser
+from llm_parser import LLMDataExtractor
 
-# ==========================================
-# 1. OCR И ПРЕДОБРАБОТКА
-# ==========================================
-class ImagePreprocessor:
-    @staticmethod
-    def enhance_image(image: np.ndarray) -> np.ndarray:
-        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-        denoised = cv2.bilateralFilter(gray, 5, 50, 50) 
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        return cv2.cvtColor(clahe.apply(denoised), cv2.COLOR_GRAY2RGB)
+# Настройка страницы
+st.set_page_config(page_title="SOTA VLM Parser Pro", layout="wide")
 
-class OCRProcessor:
+class SotaVLMProcessor:
     def __init__(self):
-        self.engine = PaddleOCR(use_angle_cls=True, lang='ru', show_log=False, 
-                                det_db_unclip_ratio=1.5, det_db_thresh=0.2, 
-                                det_db_box_thresh=0.5, det_limit_side_len=1500)
+        self.model_id = "Qwen/Qwen2-VL-2B-Instruct"
+        try:
+            with st.spinner("Загрузка SOTA VLM модели (4GB)..."):
+                self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+                    self.model_id, 
+                    torch_dtype="auto", 
+                    device_map="auto"
+                )
+                self.processor = AutoProcessor.from_pretrained(self.model_id)
+        except Exception as e:
+            st.error(f"Критическая ошибка загрузки модели: {e}")
 
-    def extract_data(self, image: np.ndarray, progress_bar=None):
-        dt_boxes, _ = self.engine.text_detector(image)
-        if dt_boxes is None or len(dt_boxes) == 0: return []
-        results = []
-        for i, box in enumerate(dt_boxes):
-            pts = box.astype("float32")
-            w, h = int(np.linalg.norm(pts[0]-pts[1])), int(np.linalg.norm(pts[0]-pts[3]))
-            # Минимальный паддинг 2px
-            M = cv2.getPerspectiveTransform(pts, np.array([[2,2],[w+2,2],[w+2,h+2],[2,h+2]], "float32"))
-            crop = cv2.warpPerspective(image, M, (w+4, h+4))
-            up = cv2.resize(crop, (w*3, h*3), interpolation=cv2.INTER_LANCZOS4)
-            rec, _ = self.engine.text_recognizer([up])
-            if rec and rec[0][1] > 0.4:
-                results.append([box.tolist(), rec[0]])
-            if progress_bar: progress_bar.progress((i+1)/len(dt_boxes))
-        return results
+    def process_image(self, image_pil, config):
+        fields = list(config.get("FIELDS", {}).keys())
+        tables = list(config.get("TABLES", {}).keys())
 
-# ==========================================
-# 2. GUI
-# ==========================================
-st.set_page_config(page_title="TTN Parser Elite", layout="wide")
+        # МАКСИМАЛЬНО ЖЕСТКИЙ ПРОМПТ НА АНГЛИЙСКОМ (для лучшего понимания моделью 2B)
+        # Мы требуем только JSON-подобную структуру в Markdown, чтобы исключить болтовню.
+        prompt = f"""Task: OCR Extraction.
+1. Identify these keys: {fields}.
+2. Extract these tables: {tables}.
+
+Instructions:
+- Use Russian language for values.
+- If a value is not found, write "not found".
+- Format: Strictly Markdown.
+- No conversational text. No "Sure", no "I can help". 
+- Only data."""
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image", 
+                        "image": image_pil,
+                        "min_pixels": 256 * 256,
+                        "max_pixels": 1024 * 1024, # Оптимально для 2B
+                    },
+                    {"type": "text", "text": prompt}
+                ],
+            }
+        ]
+
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        image_inputs, _ = process_vision_info(messages)
+        inputs = self.processor(text=[text], images=image_inputs, padding=True, return_tensors="pt").to(self.model.device)
+
+        with torch.no_grad():
+            generated_ids = self.model.generate(
+                **inputs, 
+                max_new_tokens=1024,
+                temperature=0.0,      # АБСОЛЮТНЫЙ НОЛЬ (запрет на фантазию)
+                do_sample=False,      # Отключаем случайный выбор токенов
+                repetition_penalty=1.2,
+                no_repeat_ngram_size=5 
+            )
+            generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
+            return self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+
+# --- Инициализация ---
 
 @st.cache_resource
-def get_ocr(): return OCRProcessor()
-ocr = get_ocr()
+def load_vlm_engine():
+    return SotaVLMProcessor()
 
-st.title("📄 ТТН в json")
+@st.cache_resource
+def load_llm_extractor():
+    return LLMDataExtractor()
+
+vlm = load_vlm_engine()
+llm = load_llm_extractor()
+
+# --- Интерфейс ---
+
+st.title("🚀 SOTA Document VLM (No-Hallucination Mode)")
 
 with st.sidebar:
-    selected_template = st.selectbox("Шаблон:", list(DOC_TEMPLATES.keys()))
-    config = DOC_TEMPLATES[selected_template]
+    st.header("Настройки")
+    selected_tpl_name = st.selectbox("Шаблон документа:", list(DOC_TEMPLATES.keys()))
+    current_config = DOC_TEMPLATES[selected_tpl_name]
+    if st.button("Очистить"):
+        st.session_state.clear()
+        st.rerun()
 
-up_file = st.file_uploader("Загрузите файл", type=['png', 'jpg', 'jpeg'])
+file = st.file_uploader("Загрузить скан", type=['png', 'jpg', 'jpeg'])
 
-if up_file:
-    img_arr = np.array(Image.open(up_file))
-    p_bar = st.progress(0)
-    enhanced = ImagePreprocessor.enhance_image(img_arr)
-    raw_data = ocr.extract_data(enhanced, p_bar)
-    p_bar.empty()
+if file:
+    img = Image.open(file).convert("RGB")
+    col1, col2 = st.columns([1, 1])
     
-    col_img, col_res = st.columns([1, 1.8])
-    with col_img: st.image(enhanced)
+    with col1:
+        st.image(img, use_column_width=True)
 
-    with col_res:
-        # 1. Поля (FIELDS)
-        field_keywords = []
-        for kws in config.get("FIELDS", {}).values(): field_keywords.extend(kws)
-        
-        parser_settings = config.get("PARSER_SETTINGS", {})
-        table_regions = TableParser.detect_table_regions(
-            ocr_results=raw_data,
-            tables_cfg=config.get("TABLES", {}),
-            field_keywords=field_keywords,
-            parser_settings=parser_settings,
-        )
-        free_text_y_min = 0.0
-        if table_regions:
-            free_text_y_min = max(region["y_max"] for region in table_regions.values()) + 5
+    with col2:
+        if st.button("🚀 Начать разбор"):
+            with st.spinner("VLM сканирует (Strict Mode)..."):
+                markdown_output = vlm.process_image(img, current_config)
+                st.session_state.last_markdown = markdown_output
 
-        fields, used_idx = FieldExtractor.extract_from_free_text(
-            raw_data,
-            config.get("FIELDS", {}),
-            free_text_y_min=free_text_y_min,
-            table_regions=table_regions,
-        )
-        
-        st.subheader("📝 Поля документа")
-        f_cols = st.columns(len(fields))
-        for i, (k, v) in enumerate(fields.items()):
-            with f_cols[i % len(f_cols)]:
-                st.metric(k, v if v else "❌")
-        
-        st.divider()
+        if 'last_markdown' in st.session_state:
+            with st.expander("Сырой Markdown от VLM"):
+                st.text(st.session_state.last_markdown)
 
-        # 2. Таблицы
-        if "TABLES" in config:
-            for t_name, t_cfg in config["TABLES"].items():
-                st.subheader(f"📊 {t_name}")
-                df, missing = TableParser.extract_table(
-                    raw_data,
-                    t_cfg,
-                    t_name,
-                    used_idx,
-                    img_arr.shape[1],
-                    field_keywords,
-                    parser_settings=parser_settings,
-                    region_bounds=table_regions.get(t_name),
-                )
-                
-                if not df.empty:
-                    # Функция для закрашивания missing столбцов
-                    def highlight(x):
-                        c = 'background-color: #ffffcc'
-                        df1 = pd.DataFrame('', index=x.index, columns=x.columns)
-                        for col in missing:
-                            if col in df1.columns: df1[col] = c
-                        return df1
-
-                    st.dataframe(df.style.apply(highlight, axis=None), use_container_width=True, hide_index=True)
-                    st.download_button(f"Скачать JSON", df.to_json(orient='records', force_ascii=False), key=f"d_{t_name}")
-                else: st.warning(f"Таблица '{t_name}' не найдена.")
+            if st.button("📦 Сформировать JSON"):
+                with st.spinner("Ollama чистит галлюцинации..."):
+                    final_json, raw_res = llm.extract_from_vlm(st.session_state.last_markdown, current_config)
+                    st.session_state.last_json = final_json
+            
+            if 'last_json' in st.session_state and st.session_state.last_json:
+                st.subheader("Итоговый JSON")
+                st.json(st.session_state.last_json)
+                st.download_button("📥 Скачать JSON", json.dumps(st.session_state.last_json, indent=4, ensure_ascii=False), "result.json")
