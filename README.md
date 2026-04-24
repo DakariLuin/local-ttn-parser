@@ -79,11 +79,9 @@
 
 ## Демо-видео
 
-Демонстрация работы проекта доступна в репозитории:
+Демонстрация работы проекта доступна по внешней ссылке:
 
-- [`docs/media/TTN_working_example.mp4`](docs/media/TTN_working_example.mp4)
-
-Если GitHub в браузере не воспроизводит `.mkv`, файл можно скачать и открыть локально любым видеоплеером (VLC, MPC-HC и т.д.).
+- [YouTube: демонстрация работы TTN Parser](https://youtu.be/iJ362ql0T8M)
 
 ## Результаты проверки качества
 
@@ -116,7 +114,7 @@
 ### 1. Клонирование репозитория
 
 ```bash
-git clone <URL_ВАШЕГО_РЕПОЗИТОРИЯ>
+git clone https://github.com/DakariLuin/local-ttn-parser.git
 cd local-ttn-parser
 ```
 
