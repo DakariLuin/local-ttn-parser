@@ -81,7 +81,7 @@
 
 Демонстрация работы проекта доступна в репозитории:
 
-- [`docs/media/2026-04-23 20-20-25.mkv`](docs/media/TTN_working_example.mp4)
+- [`docs/media/TTN_working_example.mp4`](docs/media/TTN_working_example.mp4)
 
 Если GitHub в браузере не воспроизводит `.mkv`, файл можно скачать и открыть локально любым видеоплеером (VLC, MPC-HC и т.д.).
 
